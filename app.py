@@ -117,32 +117,6 @@ def main():
 if __name__ == "__main__":
     main()
 
-=== requirements.txt ===
-streamlit==1.28.0
-requests==2.31.0
-pandas==2.1.3
-numpy==1.26.2
-reportlab==4.0.7
-python-dateutil==2.8.2
 
-=== .streamlit/secrets.toml.example ===
-[api]
-API_FOOTBALL_KEY = "sua_chave_aqui"
 
-=== README.md ===
-# Projeto Streamlit de Análise de Futebol
 
-## Passo a passo para GitHub e Streamlit Cloud
-1. Crie um repositório no GitHub.
-2. Adicione os arquivos: app.py, requirements.txt, .streamlit/secrets.toml.example e README.md.
-3. No Streamlit Cloud, conecte o repositório e faça deploy.
-4. Configure os Secrets no Streamlit Cloud copiando o conteúdo de .streamlit/secrets.toml.example e preenchendo a chave real.
-
-## Configuração dos Secrets
-- Nunca exponha a chave API_FOOTBALL_KEY no código.
-- Use st.secrets ou variável de ambiente.
-
-## Importante sobre requirements.txt
-O arquivo requirements.txt nunca deve ser colado dentro de app.py. As dependências devem permanecer exclusivamente no arquivo requirements.txt para que o deploy no Streamlit Cloud funcione corretamente. O app.py não deve conter nenhuma linha de versão de pacotes.
-
-O código é executável no Streamlit com Python 3.11.
