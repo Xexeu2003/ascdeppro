@@ -1,212 +1,302 @@
-import streamlit as st
-import requests
-import pandas as pd
+import io
 import os
+from datetime import date
+from math import floor
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import requests
+import streamlit as st
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 from scipy.stats import poisson
 
-# Configuração de cache para chamadas à API
-@st.cache_data(ttl=3600)
-def fetch_api(endpoint, params, api_key):
-    url = f"https://api-sports.io{endpoint}"
-    headers = {"x-apisports-key": api_key}
+
+# URL oficial da API-Football v3.
+BASE_URL = "https://v3.football.api-sports.io"
+
+# Ligas iniciais. O usuário pode informar outros IDs no campo lateral.
+LEAGUES = {
+    "Finlândia - Veikkausliiga": 244,
+    "Dinamarca - Superliga": 119,
+    "Islândia - Úrvalsdeild": 166,
+    "Holanda - Eredivisie": 88,
+    "Holanda - Eerste Divisie": 89,
+    "Polônia - Ekstraklasa": 106,
+    "Hungria - NB I": 271,
+    "Sérvia - Super Liga": 286,
+    "EUA - MLS": 253,
+    "Colômbia - Primera A": 239,
+    "Argentina - Liga Profesional": 128,
+}
+
+
+def get_api_key() -> str:
+    """Lê a chave do Streamlit Secrets ou da variável de ambiente."""
     try:
-        response = requests.get(url, headers=headers, params=params, timeout=10)
+        key = st.secrets.get("API_FOOTBALL_KEY", "")
+        if key:
+            return str(key).strip()
+        # Também aceita o formato [api] usado em configurações antigas.
+        api_section = st.secrets.get("api", {})
+        if isinstance(api_section, dict):
+            return str(api_section.get("API_FOOTBALL_KEY", "")).strip()
+    except Exception:
+        pass
+    return os.getenv("API_FOOTBALL_KEY", "").strip()
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def api_get(endpoint: str, params: Dict[str, Any], api_key: str) -> List[Dict[str, Any]]:
+    """Consulta a API e guarda a resposta por 30 minutos para economizar requisições."""
+    try:
+        response = requests.get(
+            f"{BASE_URL}/{endpoint}",
+            headers={"x-apisports-key": api_key},
+            params=params,
+            timeout=30,
+        )
         response.raise_for_status()
-        data = response.json()
-        if 'response' not in data or not data['response']:
-            return []
-        return data['response']
-    except Exception as e:
-        st.error(f"Erro na API ({endpoint}): {str(e)}")
-        return []
+        payload = response.json()
+        errors = payload.get("errors") or {}
+        if errors:
+            raise RuntimeError(str(errors))
+        return payload.get("response") or []
+    except requests.RequestException as exc:
+        st.warning(f"Falha de comunicação com a API em {endpoint}: {exc}")
+    except Exception as exc:
+        st.warning(f"A API retornou um erro em {endpoint}: {exc}")
+    return []
 
-def get_api_key():
-    if 'api' in st.secrets and 'API_FOOTBALL_KEY' in st.secrets['api']:
-        return st.secrets['api']['API_FOOTBALL_KEY']
-    return os.getenv('API_FOOTBALL_KEY', '')
 
-def calculate_poisson_prob(mean, threshold):
-    if mean <= 0:
-        return 0.0
-    return float(1 - poisson.cdf(threshold - 1, mean))
+def completed(fixtures: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Mantém somente partidas encerradas com placar disponível."""
+    result = []
+    for fixture in fixtures:
+        status = fixture.get("fixture", {}).get("status", {}).get("short", "")
+        goals = fixture.get("goals", {})
+        if status in {"FT", "AET", "PEN"} and goals.get("home") is not None and goals.get("away") is not None:
+            result.append(fixture)
+    return result
 
-def analisar_gols_equipe(fixtures, team_id):
-    """Calcula a média de gols marcados e sofridos por uma equipe específica"""
-    if not fixtures:
-        return 0.0, 0.0, 0.0, 0.0
-    
-    gols_marcados_total = 0
-    gols_sofridos_total = 0
-    gols_marcados_ht = 0
-    gols_sofridos_ht = 0
-    
-    for f in fixtures:
-        is_home = f['teams']['home']['id'] == team_id
-        
-        # Gols do Tempo Total (FT)
-        g_marcados_ft = f['goals']['home'] if is_home else f['goals']['away']
-        g_sofridos_ft = f['goals']['away'] if is_home else f['goals']['home']
-        gols_marcados_total += g_marcados_ft or 0
-        gols_sofridos_total += g_sofridos_ft or 0
-        
-        # Gols do Primeiro Tempo (HT)
-        g_marcados_ht = f['score']['halftime']['home'] if is_home else f['score']['halftime']['away']
-        g_sofridos_ht = f['score']['halftime']['away'] if is_home else f['score']['halftime']['home']
-        gols_marcados_ht += g_marcados_ht or 0
-        gols_sofridos_ht += g_sofridos_ht or 0
-        
-    total_jogos = len(fixtures)
-    return (gols_marcados_ht / total_jogos, gols_sofridos_ht / total_jogos, 
-            gols_marcados_total / total_jogos, gols_sofridos_total / total_jogos)
 
-def calcular_btts_poisson(lambda_casa, lambda_visitante):
-    """Calcula Ambas Marcam baseado na probabilidade de nenhum time ficar zerado"""
-    p_casa_zero = poisson.pmf(0, lambda_casa)
-    p_visitante_zero = poisson.pmf(0, lambda_visitante)
-    p_btts_nao = p_casa_zero + p_visitante_zero - (p_casa_zero * p_visitante_zero)
-    return float(1 - p_btts_nao)
+def stat_value(fixture: Dict[str, Any], team_id: int, names: set) -> Optional[float]:
+    """Obtém um indicador da resposta de /fixtures/statistics."""
+    for team_block in fixture.get("statistics", []):
+        if team_block.get("team", {}).get("id") != team_id:
+            continue
+        for item in team_block.get("statistics", []):
+            if item.get("type") in names:
+                value = item.get("value")
+                if value is None:
+                    return None
+                if isinstance(value, str):
+                    value = value.replace("%", "").strip()
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    return None
+    return None
 
-def calcular_placares_provaveis(lambda_casa, lambda_visitante, max_gols=4):
-    """Calcula a probabilidade combinada dos placares mais comuns até max_gols"""
-    placares = []
-    for g_casa in range(max_gols + 1):
-        for g_vis in range(max_gols + 1):
-            prob_casa = poisson.pmf(g_casa, lambda_casa)
-            prob_vis = poisson.pmf(g_vis, lambda_visitante)
-            prob_combinada = prob_casa * prob_vis * 100
-            placares.append({
-                "Placar": f"{g_casa} x {g_vis}",
-                "Probabilidade (%)": round(prob_combinada, 1)
-            })
-    placares_ordenados = sorted(placares, key=lambda x: x["Probabilidade (%)"], reverse=True)
-    return placares_ordenados[:3]
 
-def aplicar_estilos_coluna(df):
-    """Retorna uma matriz de estilos CSS baseada nas regras de mercado solicitadas"""
-    estilos = pd.DataFrame('', index=df.index, columns=df.columns)
-    
-    for idx, row in df.iterrows():
-        if row['Over 0.5 HT (%)'] >= 80.0:
-            estilos.at[idx, 'Over 0.5 HT (%)'] = 'background-color: #D1FAE5; color: #065F46; font-weight: bold;'
-            
-        if row['Over 1.5 FT (%)'] >= 75.0:
-            estilos.at[idx, 'Over 1.5 FT (%)'] = 'background-color: #DBEAFE; color: #1E40AF; font-weight: bold;'
-            
-        if 55.0 <= row['BTTS Sim (%)'] <= 70.0:
-            estilos.at[idx, 'BTTS Sim (%)'] = 'background-color: #FEF3C7; color: #92400E; font-weight: bold;'
-            
-        estilos.at[idx, 'Placares Mais Prováveis'] = 'background-color: #F3E8FF; color: #6B21A8;'
-        
-    return estilos
+def fixture_metric(fixture: Dict[str, Any], team_id: int, metric: str) -> Optional[float]:
+    names = {
+        "corners": {"Corner Kicks", "Corners"},
+        "cards": {"Yellow Cards", "Cards"},
+    }
+    return stat_value(fixture, team_id, names[metric])
 
-def main():
-    st.set_page_config(page_title="Apostas de Valor do Dia", layout="wide")
-    st.title("⚽ Predictor Inteligente - HT, FT, BTTS & Módulo de Prospecção")
-    
+
+def team_averages(fixtures: List[Dict[str, Any]], team_id: int) -> Dict[str, float]:
+    """Calcula médias de gols HT/FT, escanteios e cartões da equipe."""
+    rows = []
+    for f in completed(fixtures):
+        home = f.get("teams", {}).get("home", {})
+        away = f.get("teams", {}).get("away", {})
+        is_home = home.get("id") == team_id
+        goals = f.get("goals", {})
+        ht = f.get("score", {}).get("halftime", {})
+        gf = goals.get("home" if is_home else "away")
+        ga = goals.get("away" if is_home else "home")
+        hgf = ht.get("home" if is_home else "away")
+        hga = ht.get("away" if is_home else "home")
+        if gf is None or ga is None:
+            continue
+        rows.append({
+            "gf_ft": float(gf), "ga_ft": float(ga),
+            "gf_ht": float(hgf or 0), "ga_ht": float(hga or 0),
+            "corners": fixture_metric(f, team_id, "corners"),
+            "cards": fixture_metric(f, team_id, "cards"),
+        })
+    if not rows:
+        return {k: np.nan for k in ["gf_ft", "ga_ft", "gf_ht", "ga_ht", "corners", "cards"]}
+    frame = pd.DataFrame(rows)
+    return {column: float(frame[column].dropna().mean()) if frame[column].notna().any() else np.nan for column in frame.columns}
+
+
+def league_averages(fixtures: List[Dict[str, Any]]) -> Dict[str, float]:
+    """Calcula médias da competição; é usada como referência do modelo."""
+    all_rows = []
+    for f in completed(fixtures):
+        goals = f.get("goals", {})
+        ht = f.get("score", {}).get("halftime", {})
+        if goals.get("home") is None or goals.get("away") is None:
+            continue
+        all_rows.append({
+            "gf_ft": (float(goals["home"]) + float(goals["away"])) / 2,
+            "gf_ht": (float(ht.get("home") or 0) + float(ht.get("away") or 0)) / 2,
+        })
+    if not all_rows:
+        return {"gf_ft": np.nan, "gf_ht": np.nan}
+    frame = pd.DataFrame(all_rows)
+    return {column: float(frame[column].mean()) for column in frame.columns}
+
+
+def blend(values: List[Tuple[float, float]]) -> float:
+    """Combina valores com pesos, ignorando dados ausentes e renormalizando pesos."""
+    valid = [(value, weight) for value, weight in values if pd.notna(value) and value >= 0]
+    if not valid:
+        return np.nan
+    total_weight = sum(weight for _, weight in valid)
+    return sum(value * weight for value, weight in valid) / total_weight
+
+
+def over_probability(lamb: float, line: float) -> float:
+    """P(X > linha) para X ~ Poisson(lambda). Ex.: linha 1.5 significa X >= 2."""
+    if pd.isna(lamb) or lamb <= 0:
+        return np.nan
+    minimum = floor(line) + 1
+    return float(1 - poisson.cdf(minimum - 1, lamb))
+
+
+def btts_probability(lambda_home: float, lambda_away: float) -> float:
+    if pd.isna(lambda_home) or pd.isna(lambda_away) or lambda_home < 0 or lambda_away < 0:
+        return np.nan
+    return float((1 - np.exp(-lambda_home)) * (1 - np.exp(-lambda_away)))
+
+
+def top_scores(lambda_home: float, lambda_away: float, limit: int = 3) -> str:
+    if pd.isna(lambda_home) or pd.isna(lambda_away):
+        return "Dados insuficientes"
+    scores = []
+    for home_goals in range(0, 7):
+        for away_goals in range(0, 7):
+            probability = poisson.pmf(home_goals, lambda_home) * poisson.pmf(away_goals, lambda_away)
+            scores.append((probability, f"{home_goals}x{away_goals}"))
+    scores.sort(reverse=True)
+    return " | ".join(f"{score} ({prob * 100:.1f}%)" for prob, score in scores[:limit])
+
+
+def pdf_bytes(frame: pd.DataFrame) -> bytes:
+    """Gera um PDF simples com a tabela filtrada."""
+    buffer = io.BytesIO()
+    document = SimpleDocTemplate(buffer, pagesize=landscape(A4), rightMargin=20, leftMargin=20, topMargin=20, bottomMargin=20)
+    styles = getSampleStyleSheet()
+    elements = [Paragraph("Análise estatística de futebol", styles["Title"]), Spacer(1, 10)]
+    export = frame.copy().astype(str)
+    data = [list(export.columns)] + export.values.tolist()
+    table = Table(data, repeatRows=1)
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#17365D")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+        ("FONTSIZE", (0, 0), (-1, -1), 7),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+    ]))
+    elements.append(table)
+    document.build(elements)
+    return buffer.getvalue()
+
+
+def main() -> None:
+    st.set_page_config(page_title="Analisador de Futebol", page_icon="⚽", layout="wide")
+    st.title("⚽ Analisador de Futebol — Poisson")
+    st.caption("Estimativas estatísticas; não são garantia de resultado nem recomendação de aposta.")
+
     api_key = get_api_key()
     if not api_key:
-        st.warning("Configure a chave API_FOOTBALL_KEY nos Secrets ou variável de ambiente.")
-        return
-    
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        league_id = st.number_input("ID da Liga", value=39)
-    with col2:
-        season = st.number_input("Temporada", value=2024)
-    with col3:
-        min_prob = st.slider("Filtrar por Probabilidade Mínima Geral (%)", 50, 95, 65)
-        
-    show_all = st.checkbox("Mostrar todos os jogos na grade geral")
-    
-    if "df_resultados" not in st.session_state:
-        st.session_state.df_resultados = None
-    if "lista_resultados" not in st.session_state:
-        st.session_state.lista_resultados = []
+        st.error("Configure API_FOOTBALL_KEY em Streamlit Secrets ou nas variáveis de ambiente.")
+        st.code('API_FOOTBALL_KEY = "sua_chave_aqui"', language="toml")
+        st.stop()
 
-    if st.button("🚀 Executar Análise e Triagem"):
-        with st.spinner("Processando banco de dados e aplicando regras de colação estatística..."):
-            fixtures = fetch_api("fixtures", {"league": league_id, "season": season, "next": 8}, api_key)
-            
-            if not fixtures:
-                st.info("Nenhum jogo futuro agendado para esta liga.")
-                return
-            
-            results = []
-            for fix in fixtures:
-                home_id = fix['teams']['home']['id']
-                away_id = fix['teams']['away']['id']
-                
-                last_home = fetch_api("fixtures", {"team": home_id, "last": 8, "status": "FT"}, api_key)
-                last_away = fetch_api("fixtures", {"team": away_id, "last": 8, "status": "FT"}, api_key)
-                
-                home_m_ht, home_s_ht, home_m_ft, home_s_ft = analisar_gols_equipe(last_home, home_id)
-                away_m_ht, away_s_ht, away_m_ft, away_s_ft = analisar_gols_equipe(last_away, away_id)
-                
-                exp_gols_casa_ht = (home_m_ht + away_s_ht) / 2
-                exp_gols_visitante_ht = (away_m_ht + home_s_ht) / 2
-                avg_goals_ht = exp_gols_casa_ht + exp_gols_visitante_ht
-                
-                exp_gols_casa_ft = (home_m_ft + away_s_ft) / 2
-                exp_gols_visitante_ft = (away_m_ft + home_s_ft) / 2
-                avg_goals_ft = exp_gols_casa_ft + exp_gols_visitante_ft
-                
-                p_over05_ht = calculate_poisson_prob(avg_goals_ht, 0.5) * 100
-                p_over15_ft = calculate_poisson_prob(avg_goals_ft, 1.5) * 100
-                p_btts = calcular_btts_poisson(exp_gols_casa_ft, exp_gols_visitante_ft) * 100
-                
-                top_placares = calcular_placares_provaveis(exp_gols_casa_ft, exp_gols_visitante_ft)
-                texto_placares = " | ".join([f"{p['Placar']} ({p['Probabilidade (%)']}% )" for p in top_placares])
-                
-                if (p_over05_ht >= min_prob or p_over15_ft >= min_prob or p_btts >= min_prob) or show_all:
-                    results.append({
-                        "Jogo": f"{fix['teams']['home']['name']} vs {fix['teams']['away']['name']}",
-                        "Data": fix['fixture']['date'][:10],
-                        "Over 0.5 HT (%)": round(p_over05_ht, 1),
-                        "Over 1.5 FT (%)": round(p_over15_ft, 1),
-                        "BTTS Sim (%)": round(p_btts, 1),
-                        "Placares Mais Prováveis": texto_placares
+    with st.sidebar:
+        st.header("Configuração")
+        league_name = st.selectbox("Liga", list(LEAGUES.keys()))
+        custom_id = st.number_input("Ou informe outro ID de liga (0 = usar a lista)", min_value=0, value=0, step=1)
+        league_id = int(custom_id or LEAGUES[league_name])
+        season = st.number_input("Temporada", min_value=2010, max_value=2035, value=2024, step=1)
+        games_to_analyze = st.slider("Próximos jogos", 1, 20, 8)
+        history_size = st.slider("Últimos jogos por equipe", 5, 10, 10)
+        min_probability = st.slider("Probabilidade mínima (%)", 50, 95, 75)
+        corners_line = st.selectbox("Linha de escanteios", [7.5, 8.5, 9.5, 10.5], index=1)
+        cards_line = st.selectbox("Linha de cartões", [2.5, 3.5, 4.5, 5.5], index=1)
+        strict_filter = st.checkbox("Exigir todos os mercados ≥ mínimo", value=False)
+
+    if "analysis" not in st.session_state:
+        st.session_state.analysis = None
+
+    if st.button("🔎 Buscar e analisar", type="primary"):
+        with st.spinner("Buscando partidas e calculando as probabilidades..."):
+            upcoming = api_get("fixtures", {"league": league_id, "season": int(season), "next": int(games_to_analyze)}, api_key)
+            upcoming = [f for f in upcoming if f.get("fixture", {}).get("status", {}).get("short") in {"NS", "TBD"}]
+            season_fixtures = api_get("fixtures", {"league": league_id, "season": int(season)}, api_key)
+            league_avg = league_averages(season_fixtures)
+            rows = []
+
+            for match in upcoming:
+                home = match.get("teams", {}).get("home", {})
+                away = match.get("teams", {}).get("away", {})
+                home_id, away_id = home.get("id"), away.get("id")
+                if not home_id or not away_id:
+                    continue
+                home_history = api_get("fixtures", {"team": home_id, "last": history_size}, api_key)
+                away_history = api_get("fixtures", {"team": away_id, "last": history_size}, api_key)
+                h2h_history = api_get("fixtures", {"h2h": f"{home_id}-{away_id}", "last": 10}, api_key)
+                h = team_averages(home_history, home_id)
+                a = team_averages(away_history, away_id)
+                hh = league_averages(h2h_history)
+
+                # Mistura últimos jogos, liga e H2H. H2H é usado apenas quando existe.
+                lambda_ht = blend([(h["gf_ht"], .35), (a["ga_ht"], .35), (league_avg["gf_ht"], .20), (hh["gf_ht"], .10)]) * 2
+                lambda_ft = blend([(h["gf_ft"], .35), (a["ga_ft"], .35), (league_avg["gf_ft"], .20), (hh["gf_ft"], .10)]) * 2
+                lambda_home_ft = blend([(h["gf_ft"], .40), (a["ga_ft"], .40), (league_avg["gf_ft"], .20)])
+                lambda_away_ft = blend([(a["gf_ft"], .40), (h["ga_ft"], .40), (league_avg["gf_ft"], .20)])
+                corner_lambda = blend([(h["corners"], .45), (a["corners"], .45)])
+                card_lambda = blend([(h["cards"], .45), (a["cards"], .45)])
+
+                probabilities = {
+                    "Over 0.5 HT (%)": over_probability(lambda_ht, .5),
+                    "Over 1.5 FT (%)": over_probability(lambda_ft, 1.5),
+                    "BTTS (%)": btts_probability(lambda_home_ft, lambda_away_ft),
+                    f"Over {corners_line} cantos (%)": over_probability(corner_lambda, corners_line),
+                    f"Over {cards_line} cartões (%)": over_probability(card_lambda, cards_line),
+                }
+                values = {key: round(value * 100, 1) if pd.notna(value) else np.nan for key, value in probabilities.items()}
+                selected = [value for value in values.values() if pd.notna(value)]
+                qualifies = all(value >= min_probability for value in selected) if strict_filter else any(value >= min_probability for value in selected)
+                if qualifies:
+                    rows.append({
+                        "Jogo": f"{home.get('name', '?')} x {away.get('name', '?')}",
+                        "Data": match.get("fixture", {}).get("date", "")[:16].replace("T", " "),
+                        **values,
+                        "Placares prováveis": top_scores(lambda_home_ft, lambda_away_ft),
                     })
-            
-            if results:
-                st.session_state.lista_resultados = results
-                st.session_state.df_resultados = pd.DataFrame(results)
-            else:
-                st.session_state.df_resultados = None
-                st.info("Nenhuma partida atingiu os parâmetros de probabilidade calculados.")
 
-    # Renderização Condicional da Interface
-    if st.session_state.df_resultados is not None:
-        df_base = st.session_state.df_resultados
-        
-        # ----------------------------------------------------
-        # BLOCO 1: SELEÇÃO EXCLUSIVA - APOSTAS DE VALOR DO DIA
-        # ----------------------------------------------------
-        st.markdown("---")
-        st.subheader("🎯 Filtro de Elite: Apostas de Valor do Dia")
-        st.caption("Partidas que cumprem as 3 condições de excelência matemática simultaneamente.")
-        
-        # Criação da máscara lógica rigorosa
-        mascara_valor = (
-            (df_base['Over 0.5 HT (%)'] >= 80.0) & 
-            (df_base['Over 1.5 FT (%)'] >= 75.0) & 
-            (df_base['BTTS Sim (%)'] >= 55.0)
-        )
-        df_apostas_valor = df_base[mascara_valor].copy()
-        
-        if not df_apostas_valor.empty:
-            # Mostra a lista premium aplicando as mesmas estilizações de cores
-            df_valor_estilizado = df_apostas_valor.style.apply(aplicar_estilos_coluna, axis=None)
-            st.dataframe(df_valor_estilizado, use_container_width=True)
-            
-            # Botão de download rápido exclusivo para a Lista Premium do Dia
-            csv_valor = df_apostas_valor.to_csv(index=False)
-            st.download_button("📥 Baixar Apenas Dicas de Elite (CSV)", csv_valor, "apostas_valor_premium.csv", "text/csv")
+            st.session_state.analysis = pd.DataFrame(rows)
+
+    if st.session_state.analysis is not None:
+        frame = st.session_state.analysis
+        if frame.empty:
+            st.warning("Nenhuma partida atingiu o filtro. Reduza a linha ou a probabilidade mínima.")
         else:
-            st.info("Nenhum confronto analisado cumpre os critérios combinados de elite para hoje. Paciência é uma virtude no mercado.")
-            
-        # ----------------------------------------------------
-        # BLOCO 2: GRADE GERAL DE JOGOS ANALISADOS
-        # ----------------------------------------------------
-        st.markdown("---")
-        st.subheader("📋 Grade Geral de Jogos Analisados")
-        df_geral_estilizado = df_base.style.apply(aplicar_estilos_coluna, axis=None)
+            st.success(f"{len(frame)} partida(s) encontrada(s).")
+            st.dataframe(frame, use_container_width=True, hide_index=True)
+            st.download_button("📥 Baixar CSV", frame.to_csv(index=False).encode("utf-8-sig"), "analise_futebol.csv", "text/csv")
+            st.download_button("📄 Baixar PDF", pdf_bytes(frame), "analise_futebol.pdf", "application/pdf")
+
+
+if __name__ == "__main__":
+    main()
