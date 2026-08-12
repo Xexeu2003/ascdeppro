@@ -1,5 +1,5 @@
-streamlit
-requests
-pandas
-scipy
-reportlab
+streamlit==1.37.0
+requests==2.32.3
+pandas==2.2.2
+numpy==1.26.4
+reportlab==4.2.2
